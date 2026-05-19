@@ -27,6 +27,7 @@
 #include <string.h>
 
 #define PLANS_FILE "plans.txt"
+#define DELETED_FILE "deleted_plans.txt"
 
 /*
  * The task table has six columns.
@@ -92,6 +93,92 @@ static GtkTreeRowReference *editing_row_ref = NULL;
  */
 static void set_status(const char *message) {
     gtk_label_set_text(GTK_LABEL(status_label), message);
+}
+
+/*
+ * Format the date entry as YYYY-MM-DD.
+ *
+ * The user can type only digits, for example:
+ * 20260521
+ *
+ * The program will format it as:
+ * 2026-05-21
+ *
+ * This function is not called after every single key press.
+ * Instead, we call it when the user leaves the date box
+ * or when the user clicks Add / Update.
+ *
+ * This avoids cursor-jumping problems.
+ */
+static gboolean format_date_entry(GtkWidget *entry) {
+    const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
+
+    /*
+     * Keep only digits from the user's input.
+     * This means inputs like 2026/05/21 or 2026.05.21
+     * can still be converted correctly.
+     */
+    char digits[9];
+    int digit_count = 0;
+
+    for (int i = 0; text[i] != '\0' && digit_count < 8; i++) {
+        if (text[i] >= '0' && text[i] <= '9') {
+            digits[digit_count] = text[i];
+            digit_count++;
+        }
+    }
+
+    digits[digit_count] = '\0';
+
+    /*
+     * Build the formatted date.
+     *
+     * 2026     -> 2026
+     * 202605   -> 2026-05
+     * 20260521 -> 2026-05-21
+     */
+    char formatted[11];
+    int j = 0;
+
+    for (int i = 0; i < digit_count; i++) {
+        if (i == 4 || i == 6) {
+            formatted[j] = '-';
+            j++;
+        }
+
+        formatted[j] = digits[i];
+        j++;
+    }
+
+    formatted[j] = '\0';
+
+    gtk_entry_set_text(GTK_ENTRY(entry), formatted);
+    gtk_editable_set_position(GTK_EDITABLE(entry), -1);
+
+    /*
+     * Return TRUE if the date is complete.
+     * A complete date has exactly 8 digits.
+     */
+    return digit_count == 8;
+}
+
+/*
+ * This function runs when the user leaves the date input box.
+ *
+ * Example:
+ * The user types 20260521, then clicks Time.
+ * The date box will become 2026-05-21.
+ */
+static gboolean on_date_focus_out(GtkWidget *widget, GdkEvent *event, gpointer data) {
+    (void)event;
+    (void)data;
+
+    format_date_entry(widget);
+
+    /*
+     * Returning FALSE means GTK can continue its normal behaviour.
+     */
+    return FALSE;
 }
 
 /*
@@ -298,6 +385,75 @@ static void save_tasks(void) {
 }
 
 /*
+ * Save one deleted task into deleted_plans.txt.
+ *
+ * This is our simple "trash" system.
+ * When the user deletes a task, we do not lose it immediately.
+ * Instead, we append it to deleted_plans.txt.
+ *
+ * The format is the same as plans.txt:
+ * date|time|category|title|note|done
+ */
+static void save_deleted_task(
+    const char *date,
+    const char *time,
+    const char *category,
+    const char *title,
+    const char *note,
+    const char *done_text
+) {
+    /*
+     * Open deleted_plans.txt in append mode.
+     *
+     * "a" means:
+     * - create the file if it does not exist
+     * - add new content at the end
+     * - do not overwrite old deleted tasks
+     */
+    FILE *fp = fopen(DELETED_FILE, "a");
+
+    if (fp == NULL) {
+        set_status("Could not save deleted task.");
+        return;
+    }
+
+    /*
+     * Clean fields before saving.
+     * This avoids breaking the | separated file format.
+     */
+    char *clean_date = clean_field(date);
+    char *clean_time = clean_field(time);
+    char *clean_category = clean_field(category);
+    char *clean_title = clean_field(title);
+    char *clean_note = clean_field(note);
+
+    /*
+     * In the table, done is stored as "Yes" or "No".
+     * In the file, we store it as 1 or 0.
+     */
+    int done = (done_text != NULL && strcmp(done_text, "Yes") == 0) ? 1 : 0;
+
+    fprintf(
+        fp,
+        "%s|%s|%s|%s|%s|%d\n",
+        clean_date,
+        clean_time,
+        clean_category,
+        clean_title,
+        clean_note,
+        done
+    );
+
+    fclose(fp);
+
+    g_free(clean_date);
+    g_free(clean_time);
+    g_free(clean_category);
+    g_free(clean_title);
+    g_free(clean_note);
+}
+
+/*
  * Load tasks from plans.txt when the app starts.
  *
  * Important idea:
@@ -413,6 +569,13 @@ static void on_add_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
 
+    /*
+     * Format the date before reading it.
+     * This is useful if the user clicks Add directly
+     * without first leaving the date input box.
+     */
+    format_date_entry(date_entry);
+
     const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
     const char *time = gtk_entry_get_text(GTK_ENTRY(time_entry));
     const char *category = gtk_entry_get_text(GTK_ENTRY(category_entry));
@@ -425,6 +588,15 @@ static void on_add_clicked(GtkWidget *widget, gpointer data) {
      */
     if (strlen(date) == 0 || strlen(title) == 0) {
         set_status("Date and Title are required.");
+        return;
+    }
+
+    /*
+     * A complete formatted date should have 10 characters:
+     * YYYY-MM-DD
+     */
+    if (strlen(date) != 10) {
+        set_status("Please enter a complete date, for example 20260522.");
         return;
     }
 
@@ -607,6 +779,13 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
+    /*
+     * Format the date before reading it.
+     * This is useful if the user clicks Add directly
+     * without first leaving the date input box.
+     */
+    format_date_entry(date_entry);
+
     const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
     const char *time = gtk_entry_get_text(GTK_ENTRY(time_entry));
     const char *category = gtk_entry_get_text(GTK_ENTRY(category_entry));
@@ -618,6 +797,15 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
      */
     if (strlen(date) == 0 || strlen(title) == 0) {
         set_status("Date and Title are required.");
+        return;
+    }
+
+    /*
+     * A complete formatted date should have 10 characters:
+     * YYYY-MM-DD
+     */
+    if (strlen(date) != 10) {
+        set_status("Please enter a complete date, for example 20260522.");
         return;
     }
 
@@ -671,6 +859,15 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
     gtk_tree_path_free(path);
 }
 
+/*
+ * This function runs when the user clicks "Delete Selected".
+ *
+ * New behaviour:
+ * The task is not permanently lost.
+ * Before removing it from the visible list, we save it into deleted_plans.txt.
+ *
+ * This gives the user a chance to restore it later.
+ */
 static void on_delete_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
@@ -680,22 +877,179 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
     GtkTreeIter iter;
 
     if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        char *date;
+        char *time;
+        char *category;
+        char *title;
+        char *note;
+        char *done_text;
+
+        /*
+         * Read the selected task before deleting it.
+         * We need this information so we can save it into deleted_plans.txt.
+         */
+        gtk_tree_model_get(
+            model,
+            &iter,
+            COL_DATE, &date,
+            COL_TIME, &time,
+            COL_CATEGORY, &category,
+            COL_TITLE, &title,
+            COL_NOTE, &note,
+            COL_DONE, &done_text,
+            -1
+        );
+
+        /*
+         * Save the deleted task to the trash file first.
+         */
+        save_deleted_task(date, time, category, title, note, done_text);
+
+        /*
+         * Now remove it from the visible task list.
+         */
         gtk_list_store_remove(GTK_LIST_STORE(model), &iter);
 
-	/*
-     	* If the user deletes a task while editing,
-     	* cancel the current edit mode to avoid updating a deleted row.
-     	*/
-    	if (editing_row_ref != NULL) {
-        	gtk_tree_row_reference_free(editing_row_ref);
-        	editing_row_ref = NULL;
-    	}
+        /*
+         * If the user deletes a task while editing,
+         * cancel the current edit mode to avoid updating a deleted row.
+         */
+        if (editing_row_ref != NULL) {
+            gtk_tree_row_reference_free(editing_row_ref);
+            editing_row_ref = NULL;
+        }
 
+        /*
+         * Save the current active task list after deletion.
+         */
         save_tasks();
-        set_status("Task deleted.");
+
+        set_status("Task moved to trash. You can restore it with Restore Last Deleted.");
+
+        g_free(date);
+        g_free(time);
+        g_free(category);
+        g_free(title);
+        g_free(note);
+        g_free(done_text);
     } else {
         set_status("Please select a task first.");
     }
+}
+
+/*
+ * This function runs when the user clicks "Restore Last Deleted".
+ *
+ * It restores the most recently deleted task from deleted_plans.txt.
+ *
+ * How it works:
+ * 1. Read all lines from deleted_plans.txt.
+ * 2. Find the last non-empty line.
+ * 3. Convert that line back into a task.
+ * 4. Add the task back to the visible list.
+ * 5. Rewrite deleted_plans.txt without that restored line.
+ */
+static void on_restore_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    char *contents = NULL;
+    gsize length = 0;
+    GError *error = NULL;
+
+    /*
+     * Read the whole deleted_plans.txt file into memory.
+     */
+    if (!g_file_get_contents(DELETED_FILE, &contents, &length, &error)) {
+        if (error != NULL) {
+            g_error_free(error);
+        }
+
+        set_status("No deleted tasks to restore.");
+        return;
+    }
+
+    /*
+     * Split the file into lines.
+     */
+    char **lines = g_strsplit(contents, "\n", -1);
+
+    /*
+     * Find the last non-empty line.
+     * This represents the most recently deleted task.
+     */
+    int last_index = -1;
+
+    for (int i = 0; lines[i] != NULL; i++) {
+        if (strlen(lines[i]) > 0) {
+            last_index = i;
+        }
+    }
+
+    if (last_index == -1) {
+        g_strfreev(lines);
+        g_free(contents);
+        set_status("No deleted tasks to restore.");
+        return;
+    }
+
+    /*
+     * Split the last deleted task into fields.
+     */
+    char **parts = g_strsplit(lines[last_index], "|", 6);
+
+    if (
+        parts[0] != NULL &&
+        parts[1] != NULL &&
+        parts[2] != NULL &&
+        parts[3] != NULL &&
+        parts[4] != NULL &&
+        parts[5] != NULL
+    ) {
+        int done = strcmp(parts[5], "1") == 0;
+
+        /*
+         * Add the deleted task back to the visible list.
+         */
+        append_task(parts[0], parts[1], parts[2], parts[3], parts[4], done);
+
+        /*
+         * Save active tasks again, because the restored task is now back.
+         */
+        save_tasks();
+
+        set_status("Last deleted task restored.");
+    } else {
+        set_status("Could not restore deleted task.");
+    }
+
+    g_strfreev(parts);
+
+    /*
+     * Rewrite deleted_plans.txt without the restored line.
+     */
+    GString *new_contents = g_string_new("");
+
+    for (int i = 0; lines[i] != NULL; i++) {
+        if (i == last_index || strlen(lines[i]) == 0) {
+            continue;
+        }
+
+        g_string_append(new_contents, lines[i]);
+        g_string_append_c(new_contents, '\n');
+    }
+
+    if (!g_file_set_contents(DELETED_FILE, new_contents->str, -1, &error)) {
+        if (error != NULL) {
+            g_error_free(error);
+        }
+
+        set_status("Task restored, but could not update deleted_plans.txt.");
+    }
+
+    g_string_free(new_contents, TRUE);
+    g_strfreev(lines);
+    g_free(contents);
 }
 
 static void on_save_clicked(GtkWidget *widget, gpointer data) {
@@ -759,8 +1113,13 @@ int main(int argc, char *argv[]) {
     category_entry = gtk_entry_new();
     title_entry = gtk_entry_new();
     note_entry = gtk_entry_new();
+    /*
+     * Format the date when the user leaves the date input box.
+     * This is safer than formatting on every key press.
+     */
+    g_signal_connect(date_entry, "focus-out-event", G_CALLBACK(on_date_focus_out), NULL);
 
-    gtk_entry_set_placeholder_text(GTK_ENTRY(date_entry), "2026-05-22");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(date_entry), "Type 20260522");    
     gtk_entry_set_placeholder_text(GTK_ENTRY(time_entry), "14:30");
     gtk_entry_set_placeholder_text(GTK_ENTRY(category_entry), "Study / Rent / Friend / Deadline");
     gtk_entry_set_placeholder_text(GTK_ENTRY(title_entry), "Meet supervisor");
@@ -774,7 +1133,6 @@ int main(int argc, char *argv[]) {
 
     gtk_grid_attach(GTK_GRID(grid), category_label, 0, 1, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), category_entry, 1, 1, 3, 1);
-
     gtk_grid_attach(GTK_GRID(grid), title_label, 0, 2, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), title_entry, 1, 2, 3, 1);
 
@@ -789,6 +1147,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *update_button = gtk_button_new_with_label("Update Task");
     GtkWidget *done_button = gtk_button_new_with_label("Toggle Done");
     GtkWidget *delete_button = gtk_button_new_with_label("Delete Selected");
+    GtkWidget *restore_button = gtk_button_new_with_label("Restore Last Deleted");
     GtkWidget *save_button = gtk_button_new_with_label("Save");
 
     gtk_box_pack_start(GTK_BOX(button_box), add_button, FALSE, FALSE, 0);
@@ -796,6 +1155,7 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(button_box), update_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), done_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), delete_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(button_box), restore_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), save_button, FALSE, FALSE, 0);
 
     store = gtk_list_store_new(
@@ -834,6 +1194,7 @@ int main(int argc, char *argv[]) {
     g_signal_connect(update_button, "clicked", G_CALLBACK(on_update_clicked), NULL);
     g_signal_connect(done_button, "clicked", G_CALLBACK(on_toggle_done_clicked), NULL);
     g_signal_connect(delete_button, "clicked", G_CALLBACK(on_delete_clicked), NULL);
+    g_signal_connect(restore_button, "clicked", G_CALLBACK(on_restore_clicked), NULL);
     g_signal_connect(save_button, "clicked", G_CALLBACK(on_save_clicked), NULL);
     g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
 
