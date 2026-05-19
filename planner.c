@@ -73,6 +73,17 @@ static GtkWidget *tree_view;       // Table-like view that displays all tasks
 static GtkListStore *store;
 
 /*
+ * This stores the row currently being edited.
+ *
+ * Why use GtkTreeRowReference instead of GtkTreeIter?
+ * A GtkTreeIter can become unsafe if the list changes.
+ * GtkTreeRowReference is safer because it keeps a reference to a row path.
+ *
+ * If editing_row_ref is NULL, it means we are not editing any existing task.
+ */
+static GtkTreeRowReference *editing_row_ref = NULL;
+
+/*
  * Update the message shown at the bottom of the window.
  *
  * Example:
@@ -499,6 +510,167 @@ static void on_toggle_done_clicked(GtkWidget *widget, gpointer data) {
     }
 }
 
+/*
+ * This function runs when the user clicks "Edit Selected".
+ *
+ * Steps:
+ * 1. Get the selected row from the task table.
+ * 2. Read that row's Date, Time, Category, Title, and Note.
+ * 3. Put those values back into the input boxes.
+ * 4. Store a reference to this row, so that Update Task knows which row to modify.
+ */
+static void on_edit_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        char *date;
+        char *time;
+        char *category;
+        char *title;
+        char *note;
+
+        /*
+         * Read task information from the selected row.
+         */
+        gtk_tree_model_get(
+            model,
+            &iter,
+            COL_DATE, &date,
+            COL_TIME, &time,
+            COL_CATEGORY, &category,
+            COL_TITLE, &title,
+            COL_NOTE, &note,
+            -1
+        );
+
+        /*
+         * Put the selected task back into the input boxes.
+         * Now the user can edit the text.
+         */
+        gtk_entry_set_text(GTK_ENTRY(date_entry), date);
+        gtk_entry_set_text(GTK_ENTRY(time_entry), time);
+        gtk_entry_set_text(GTK_ENTRY(category_entry), category);
+        gtk_entry_set_text(GTK_ENTRY(title_entry), title);
+        gtk_entry_set_text(GTK_ENTRY(note_entry), note);
+
+        /*
+         * If we were already editing another row, free the old reference first.
+         */
+        if (editing_row_ref != NULL) {
+            gtk_tree_row_reference_free(editing_row_ref);
+            editing_row_ref = NULL;
+        }
+
+        /*
+         * Create a row reference for the selected task.
+         * This tells Update Task which row should be changed later.
+         */
+        GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+        editing_row_ref = gtk_tree_row_reference_new(model, path);
+        gtk_tree_path_free(path);
+
+        set_status("Editing selected task. Modify the fields, then click Update Task.");
+
+        /*
+         * Free strings created by gtk_tree_model_get().
+         */
+        g_free(date);
+        g_free(time);
+        g_free(category);
+        g_free(title);
+        g_free(note);
+    } else {
+        set_status("Please select a task first.");
+    }
+}
+
+/*
+ * This function runs when the user clicks "Update Task".
+ *
+ * It updates the row that was previously selected by Edit Selected.
+ * It does not create a new task.
+ */
+static void on_update_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    /*
+     * If editing_row_ref is NULL, the user has not clicked Edit Selected yet.
+     */
+    if (editing_row_ref == NULL) {
+        set_status("No task is being edited. Select a task and click Edit Selected first.");
+        return;
+    }
+
+    const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
+    const char *time = gtk_entry_get_text(GTK_ENTRY(time_entry));
+    const char *category = gtk_entry_get_text(GTK_ENTRY(category_entry));
+    const char *title = gtk_entry_get_text(GTK_ENTRY(title_entry));
+    const char *note = gtk_entry_get_text(GTK_ENTRY(note_entry));
+
+    /*
+     * Date and Title are still required when updating a task.
+     */
+    if (strlen(date) == 0 || strlen(title) == 0) {
+        set_status("Date and Title are required.");
+        return;
+    }
+
+    GtkTreeModel *model = gtk_tree_row_reference_get_model(editing_row_ref);
+    GtkTreePath *path = gtk_tree_row_reference_get_path(editing_row_ref);
+
+    /*
+     * If path is NULL, the row may have been deleted.
+     */
+    if (path == NULL) {
+        gtk_tree_row_reference_free(editing_row_ref);
+        editing_row_ref = NULL;
+        set_status("The task being edited no longer exists.");
+        return;
+    }
+
+    GtkTreeIter iter;
+
+    /*
+     * Convert the stored row path back into an iter.
+     * The iter lets us modify that row in the GtkListStore.
+     */
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        /*
+         * Only update the text fields.
+         * We keep the Done status unchanged.
+         */
+        gtk_list_store_set(
+            GTK_LIST_STORE(model),
+            &iter,
+            COL_DATE, date,
+            COL_TIME, time,
+            COL_CATEGORY, category,
+            COL_TITLE, title,
+            COL_NOTE, note,
+            -1
+        );
+
+        save_tasks();
+        set_status("Task updated.");
+
+        /*
+         * After updating, we leave edit mode.
+         */
+        gtk_tree_row_reference_free(editing_row_ref);
+        editing_row_ref = NULL;
+    } else {
+        set_status("Could not update task.");
+    }
+
+    gtk_tree_path_free(path);
+}
+
 static void on_delete_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
@@ -509,6 +681,16 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
 
     if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
         gtk_list_store_remove(GTK_LIST_STORE(model), &iter);
+
+	/*
+     	* If the user deletes a task while editing,
+     	* cancel the current edit mode to avoid updating a deleted row.
+     	*/
+    	if (editing_row_ref != NULL) {
+        	gtk_tree_row_reference_free(editing_row_ref);
+        	editing_row_ref = NULL;
+    	}
+
         save_tasks();
         set_status("Task deleted.");
     } else {
@@ -603,11 +785,15 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(main_box), button_box, FALSE, FALSE, 0);
 
     GtkWidget *add_button = gtk_button_new_with_label("Add Task");
+    GtkWidget *edit_button = gtk_button_new_with_label("Edit Selected");
+    GtkWidget *update_button = gtk_button_new_with_label("Update Task");
     GtkWidget *done_button = gtk_button_new_with_label("Toggle Done");
     GtkWidget *delete_button = gtk_button_new_with_label("Delete Selected");
     GtkWidget *save_button = gtk_button_new_with_label("Save");
 
     gtk_box_pack_start(GTK_BOX(button_box), add_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(button_box), edit_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(button_box), update_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), done_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), delete_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), save_button, FALSE, FALSE, 0);
@@ -644,6 +830,8 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(main_box), status_label, FALSE, FALSE, 0);
 
     g_signal_connect(add_button, "clicked", G_CALLBACK(on_add_clicked), NULL);
+    g_signal_connect(edit_button, "clicked", G_CALLBACK(on_edit_clicked), NULL);
+    g_signal_connect(update_button, "clicked", G_CALLBACK(on_update_clicked), NULL);
     g_signal_connect(done_button, "clicked", G_CALLBACK(on_toggle_done_clicked), NULL);
     g_signal_connect(delete_button, "clicked", G_CALLBACK(on_delete_clicked), NULL);
     g_signal_connect(save_button, "clicked", G_CALLBACK(on_save_clicked), NULL);
