@@ -182,6 +182,116 @@ static gboolean on_date_focus_out(GtkWidget *widget, GdkEvent *event, gpointer d
 }
 
 /*
+ * Format the time entry as HH:MM.
+ *
+ * The user only needs to type digits.
+ *
+ * Example:
+ * User types: 1430
+ * App shows: 14:30
+ *
+ * If the user types symbols such as : or ： or . or /,
+ * we ignore them and keep only digits.
+ *
+ * A valid time should have:
+ * - 4 digits
+ * - hour between 00 and 23
+ * - minute between 00 and 59
+ */
+static gboolean format_time_entry(GtkWidget *entry) {
+    const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
+
+    /*
+     * Keep only digits from the user's input.
+     * We only need 4 digits:
+     * HHMM
+     */
+    char digits[5];
+    int digit_count = 0;
+
+    for (int i = 0; text[i] != '\0' && digit_count < 4; i++) {
+        if (text[i] >= '0' && text[i] <= '9') {
+            digits[digit_count] = text[i];
+            digit_count++;
+        }
+    }
+
+    digits[digit_count] = '\0';
+
+    /*
+     * Build the formatted time.
+     *
+     * 1      -> 1
+     * 14     -> 14
+     * 143    -> 14:3
+     * 1430   -> 14:30
+     */
+    char formatted[6];
+    int j = 0;
+
+    for (int i = 0; i < digit_count; i++) {
+        if (i == 2) {
+            formatted[j] = ':';
+            j++;
+        }
+
+        formatted[j] = digits[i];
+        j++;
+    }
+
+    formatted[j] = '\0';
+
+    gtk_entry_set_text(GTK_ENTRY(entry), formatted);
+    gtk_editable_set_position(GTK_EDITABLE(entry), -1);
+
+    /*
+     * Empty time is allowed because some tasks may not have a specific time.
+     */
+    if (digit_count == 0) {
+        return TRUE;
+    }
+
+    /*
+     * A complete time must have exactly 4 digits.
+     */
+    if (digit_count != 4) {
+        return FALSE;
+    }
+
+    /*
+     * Check whether the time is logically valid.
+     */
+    int hour = (digits[0] - '0') * 10 + (digits[1] - '0');
+    int minute = (digits[2] - '0') * 10 + (digits[3] - '0');
+
+    if (hour < 0 || hour > 23) {
+        return FALSE;
+    }
+
+    if (minute < 0 || minute > 59) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/*
+ * This function runs when the user leaves the time input box.
+ *
+ * Example:
+ * The user types 1430, then clicks Category.
+ * The time box will become 14:30.
+ */
+static gboolean on_time_focus_out(GtkWidget *widget, GdkEvent *event, gpointer data) {
+    (void)event;
+    (void)data;
+
+    format_time_entry(widget);
+
+    return FALSE;
+}
+
+/*
  * Clean text before saving it into plans.txt.
  *
  * Our file format uses | to separate fields:
@@ -570,11 +680,12 @@ static void on_add_clicked(GtkWidget *widget, gpointer data) {
     (void)data;
 
     /*
-     * Format the date before reading it.
+     * Format the date and time before reading it.
      * This is useful if the user clicks Add directly
      * without first leaving the date input box.
      */
-    format_date_entry(date_entry);
+    gboolean date_ok = format_date_entry(date_entry);
+    gboolean time_ok = format_time_entry(time_entry);
 
     const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
     const char *time = gtk_entry_get_text(GTK_ENTRY(time_entry));
@@ -591,12 +702,22 @@ static void on_add_clicked(GtkWidget *widget, gpointer data) {
         return;
     }
 
-    /*
-     * A complete formatted date should have 10 characters:
-     * YYYY-MM-DD
-     */
-    if (strlen(date) != 10) {
+    if (!date_ok || strlen(date) != 10) {
         set_status("Please enter a complete date, for example 20260522.");
+        return;
+    }
+
+    /*
+     * Time is optional.
+     * But if the user enters a time, it must be complete and valid.
+     *
+     * Valid examples:
+     * 0930 -> 09:30
+     * 1430 -> 14:30
+     * 2359 -> 23:59
+     */
+    if (strlen(time) > 0 && !time_ok) {
+        set_status("Please enter a valid time, for example 1430.");
         return;
     }
 
@@ -780,11 +901,10 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
     }
 
     /*
-     * Format the date before reading it.
-     * This is useful if the user clicks Add directly
-     * without first leaving the date input box.
+     * Format date and time before updating the selected task.
      */
-    format_date_entry(date_entry);
+    gboolean date_ok = format_date_entry(date_entry);
+    gboolean time_ok = format_time_entry(time_entry);
 
     const char *date = gtk_entry_get_text(GTK_ENTRY(date_entry));
     const char *time = gtk_entry_get_text(GTK_ENTRY(time_entry));
@@ -804,8 +924,13 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
      * A complete formatted date should have 10 characters:
      * YYYY-MM-DD
      */
-    if (strlen(date) != 10) {
+    if (!date_ok || strlen(date) != 10) {
         set_status("Please enter a complete date, for example 20260522.");
+        return;
+    }
+
+    if (strlen(time) > 0 && !time_ok) {
+        set_status("Please enter a valid time, for example 1430.");
         return;
     }
 
@@ -1118,9 +1243,14 @@ int main(int argc, char *argv[]) {
      * This is safer than formatting on every key press.
      */
     g_signal_connect(date_entry, "focus-out-event", G_CALLBACK(on_date_focus_out), NULL);
+    /*
+     * Format the time when the user leaves the time input box.
+     * This avoids confusion between English colon : and Chinese colon ：.
+     */
+    g_signal_connect(time_entry, "focus-out-event", G_CALLBACK(on_time_focus_out), NULL);
 
     gtk_entry_set_placeholder_text(GTK_ENTRY(date_entry), "Type 20260522");    
-    gtk_entry_set_placeholder_text(GTK_ENTRY(time_entry), "14:30");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(time_entry), "Type 1430");
     gtk_entry_set_placeholder_text(GTK_ENTRY(category_entry), "Study / Rent / Friend / Deadline");
     gtk_entry_set_placeholder_text(GTK_ENTRY(title_entry), "Meet supervisor");
     gtk_entry_set_placeholder_text(GTK_ENTRY(note_entry), "Discuss dissertation plan");
