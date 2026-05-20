@@ -30,24 +30,35 @@
 #define DELETED_FILE "deleted_plans.txt"
 
 /*
- * The task table has six columns.
- * GTK ListStore uses column numbers internally.
+ * The task table has visible columns and one hidden column.
  *
- * For example:
- * COL_DATE means column 0.
- * COL_TIME means column 1.
+ * Visible columns:
+ * - Date
+ * - Time
+ * - Category
+ * - Title
+ * - Note
+ * - Done
  *
- * N_COLS is not a real column.
- * It stores the total number of columns.
+ * Hidden column:
+ * - Sort key
+ *
+ * The sort key combines date and time, for example:
+ * 2026-05-21 14:30
+ *
+ * Because our date format is YYYY-MM-DD
+ * and our time format is HH:MM,
+ * alphabetical sorting gives the same order as time sorting.
  */
 enum {
-    COL_DATE,       // Date column, e.g. 2026-05-22
-    COL_TIME,       // Time column, e.g. 14:30
-    COL_CATEGORY,   // Category column, e.g. Study, Rent, Friend
-    COL_TITLE,      // Main task title
-    COL_NOTE,       // Extra description
-    COL_DONE,       // Whether the task is done
-    N_COLS          // Total number of columns
+    COL_DATE,
+    COL_TIME,
+    COL_CATEGORY,
+    COL_TITLE,
+    COL_NOTE,
+    COL_DONE,
+    COL_SORT_KEY,   // Hidden column used only for sorting
+    N_COLS
 };
 
 /*
@@ -342,6 +353,21 @@ static void append_task(
     int done
 ) {
     GtkTreeIter iter;
+    /*
+     * Build a hidden sort key from date and time.
+     *
+     * Example:
+     * date = "2026-05-21"
+     * time = "14:30"
+     * sort_key = "2026-05-21 14:30"
+     *
+     * If time is empty, the key becomes:
+     * "2026-05-21 "
+     *
+     * This means tasks without a time will appear before timed tasks
+     * on the same date.
+     */
+    char *sort_key = g_strdup_printf("%s %s", date, time);
 
     /*
      * Add a new empty row to the store.
@@ -367,8 +393,12 @@ static void append_task(
         COL_TITLE, title,
         COL_NOTE, note,
         COL_DONE, done ? "Yes" : "No",
+	COL_SORT_KEY, sort_key,
         -1
     );
+
+    g_free(sort_key);
+
 }
 
 
@@ -954,20 +984,26 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
      * The iter lets us modify that row in the GtkListStore.
      */
     if (gtk_tree_model_get_iter(model, &iter, path)) {
-        /*
-         * Only update the text fields.
-         * We keep the Done status unchanged.
-         */
-        gtk_list_store_set(
-            GTK_LIST_STORE(model),
-            &iter,
-            COL_DATE, date,
-            COL_TIME, time,
-            COL_CATEGORY, category,
-            COL_TITLE, title,
-            COL_NOTE, note,
-            -1
-        );
+	/*
+         * Rebuild the hidden sort key after editing date or time.
+	 * Otherwise, the visible date/time changes,
+	 * but the sorting order may still use the old value.
+	 */
+	char *sort_key = g_strdup_printf("%s %s", date, time);
+
+	gtk_list_store_set(
+	    GTK_LIST_STORE(model),
+	    &iter,
+	    COL_DATE, date,
+	    COL_TIME, time,
+	    COL_CATEGORY, category,
+	    COL_TITLE, title,
+	    COL_NOTE, note,
+	    COL_SORT_KEY, sort_key,
+	    -1
+	);
+
+        g_free(sort_key);
 
         save_tasks();
         set_status("Task updated.");
@@ -1288,14 +1324,21 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(button_box), restore_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), save_button, FALSE, FALSE, 0);
 
+    /*
+     * Create the data model for the task table.
+     *
+     * There are 7 columns in the model:
+     * 6 visible columns and 1 hidden sort key column.
+     */
     store = gtk_list_store_new(
         N_COLS,
-        G_TYPE_STRING,
-        G_TYPE_STRING,
-        G_TYPE_STRING,
-        G_TYPE_STRING,
-        G_TYPE_STRING,
-        G_TYPE_STRING
+        G_TYPE_STRING,  // COL_DATE
+        G_TYPE_STRING,  // COL_TIME
+        G_TYPE_STRING,  // COL_CATEGORY
+        G_TYPE_STRING,  // COL_TITLE
+        G_TYPE_STRING,  // COL_NOTE
+        G_TYPE_STRING,  // COL_DONE
+        G_TYPE_STRING   // COL_SORT_KEY, hidden
     );
 
     tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
@@ -1305,6 +1348,20 @@ int main(int argc, char *argv[]) {
     add_column("Title", COL_TITLE);
     add_column("Note", COL_NOTE);
     add_column("Done", COL_DONE);
+    
+    /*
+     * Sort the task list automatically by the hidden sort key.
+     *
+     * Since the sort key is built as:
+     * YYYY-MM-DD HH:MM
+     *
+     * GTK_SORT_ASCENDING means earlier tasks appear first.
+     */
+    gtk_tree_sortable_set_sort_column_id(
+        GTK_TREE_SORTABLE(store),
+        COL_SORT_KEY,
+        GTK_SORT_ASCENDING
+    );
 
     GtkWidget *scrolled_window = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(
