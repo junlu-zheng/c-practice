@@ -56,6 +56,7 @@ enum {
     COL_DONE,
     COL_SORT_KEY,   // Hidden column used only for sorting
     COL_COLOR,      // Hidden column used only for text color
+    COL_REMINDER_SHOWN,  // Hidden column used to avoid repeated reminders
     N_COLS
 };
 
@@ -441,6 +442,87 @@ static void set_entry_from_date(GtkWidget *entry, const GDate *date) {
 }
 
 /*
+ * Convert task date and time into time_t.
+ *
+ * Input:
+ * date_text = "2026-05-21"
+ * time_text = "14:30"
+ *
+ * Output:
+ * task_time stores the exact local time of that task.
+ *
+ * Return:
+ * TRUE  = conversion successful
+ * FALSE = invalid date or time
+ */
+static gboolean task_datetime_to_time_t(
+    const char *date_text,
+    const char *time_text,
+    time_t *task_time
+) {
+    if (date_text == NULL || time_text == NULL || task_time == NULL) {
+        return FALSE;
+    }
+
+    /*
+     * Tasks without a specific time should not trigger time reminders.
+     */
+    if (strlen(time_text) != 5) {
+        return FALSE;
+    }
+
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+
+    if (sscanf(date_text, "%d-%d-%d", &year, &month, &day) != 3) {
+        return FALSE;
+    }
+
+    if (sscanf(time_text, "%d:%d", &hour, &minute) != 2) {
+        return FALSE;
+    }
+
+    if (!g_date_valid_dmy(day, month, year)) {
+        return FALSE;
+    }
+
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return FALSE;
+    }
+
+    struct tm task_tm;
+    memset(&task_tm, 0, sizeof(task_tm));
+
+    /*
+     * struct tm uses:
+     * tm_year = years since 1900
+     * tm_mon  = months since January, so January = 0
+     */
+    task_tm.tm_year = year - 1900;
+    task_tm.tm_mon = month - 1;
+    task_tm.tm_mday = day;
+    task_tm.tm_hour = hour;
+    task_tm.tm_min = minute;
+    task_tm.tm_sec = 0;
+
+    /*
+     * Let mktime decide daylight saving time.
+     */
+    task_tm.tm_isdst = -1;
+
+    *task_time = mktime(&task_tm);
+
+    if (*task_time == (time_t)-1) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/*
  * Show a diary reminder if the app is opened after 21:00.
  *
  * Behaviour:
@@ -543,6 +625,145 @@ static gboolean on_water_reminder_timeout(gpointer data) {
     /*
      * Return TRUE so GTK will call this function again
      * after the same time interval.
+     */
+    return TRUE;
+}
+
+/*
+ * Check upcoming tasks and show a reminder if one is close.
+ *
+ * Current rule:
+ * - Only unfinished tasks can trigger reminders.
+ * - The task must have a valid date and time.
+ * - The task must be within the next 10 minutes.
+ * - Each task is reminded only once while the app is open.
+ *
+ * This function runs every minute.
+ */
+static gboolean on_event_reminder_timeout(gpointer data) {
+    GtkWindow *parent = GTK_WINDOW(data);
+
+    time_t now = time(NULL);
+
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter);
+
+    while (valid) {
+        char *date = NULL;
+        char *time_text = NULL;
+        char *category = NULL;
+        char *title = NULL;
+        char *note = NULL;
+        char *done_text = NULL;
+        char *reminder_shown = NULL;
+
+        gtk_tree_model_get(
+            GTK_TREE_MODEL(store),
+            &iter,
+            COL_DATE, &date,
+            COL_TIME, &time_text,
+            COL_CATEGORY, &category,
+            COL_TITLE, &title,
+            COL_NOTE, &note,
+            COL_DONE, &done_text,
+            COL_REMINDER_SHOWN, &reminder_shown,
+            -1
+        );
+
+        gboolean is_done = (done_text != NULL && strcmp(done_text, "Yes") == 0);
+        gboolean already_reminded = (
+            reminder_shown != NULL &&
+            strcmp(reminder_shown, "Yes") == 0
+        );
+
+        if (!is_done && !already_reminded) {
+            time_t task_time;
+
+            if (task_datetime_to_time_t(date, time_text, &task_time)) {
+                double seconds_until_task = difftime(task_time, now);
+
+                /*
+                 * Trigger reminder if the task is within the next 10 minutes.
+                 *
+                 * 0 means the task time has arrived.
+                 * 600 seconds means 10 minutes.
+                 */
+                if (seconds_until_task >= 0 && seconds_until_task <= 600) {
+                    char message[1024];
+
+                    snprintf(
+                        message,
+                        sizeof(message),
+                        "Upcoming task in %.0f minutes:\n\n"
+                        "%s %s\n"
+                        "Category: %s\n"
+                        "Title: %s\n"
+                        "Note: %s",
+                        seconds_until_task / 60.0,
+                        date,
+                        time_text,
+                        category,
+                        title,
+                        note
+                    );
+
+                    GtkWidget *dialog = gtk_message_dialog_new(
+                        parent,
+                        GTK_DIALOG_MODAL,
+                        GTK_MESSAGE_INFO,
+                        GTK_BUTTONS_OK,
+                        "%s",
+                        message
+                    );
+
+                    gtk_window_set_title(GTK_WINDOW(dialog), "Upcoming Task Reminder");
+
+                    gtk_dialog_run(GTK_DIALOG(dialog));
+                    gtk_widget_destroy(dialog);
+
+                    /*
+                     * Mark this task as reminded for the current app session.
+                     * We do not save this to plans.txt.
+                     */
+                    gtk_list_store_set(
+                        store,
+                        &iter,
+                        COL_REMINDER_SHOWN, "Yes",
+                        -1
+                    );
+
+                    set_status("Upcoming task reminder shown.");
+
+                    g_free(date);
+                    g_free(time_text);
+                    g_free(category);
+                    g_free(title);
+                    g_free(note);
+                    g_free(done_text);
+                    g_free(reminder_shown);
+
+                    /*
+                     * Show only one task reminder each time this timer runs.
+                     * This avoids many dialogs appearing at once.
+                     */
+                    return TRUE;
+                }
+            }
+        }
+
+        g_free(date);
+        g_free(time_text);
+        g_free(category);
+        g_free(title);
+        g_free(note);
+        g_free(done_text);
+        g_free(reminder_shown);
+
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter);
+    }
+
+    /*
+     * Return TRUE so GTK checks again later.
      */
     return TRUE;
 }
@@ -986,6 +1207,7 @@ static void append_task(
         COL_DONE, done ? "Yes" : "No",
 	COL_SORT_KEY, sort_key,
 	COL_COLOR, color,
+	COL_REMINDER_SHOWN, "No",
         -1
     );
 
@@ -1960,8 +2182,8 @@ int main(int argc, char *argv[]) {
     /*
      * Create the data model for the task table.
      *
-     * There are 9 columns in the model:
-     * 7 visible columns and 2 hidden sort key column.
+     * There are 10 columns in the model:
+     * 7 visible columns and 3 hidden sort key column.
      */
     store = gtk_list_store_new(
         N_COLS,
@@ -1973,7 +2195,8 @@ int main(int argc, char *argv[]) {
         G_TYPE_STRING,  // COL_NOTE
         G_TYPE_STRING,  // COL_DONE
         G_TYPE_STRING,   // COL_SORT_KEY, hidden
-	G_TYPE_STRING   // COL_COLOR, hidden
+	G_TYPE_STRING,   // COL_COLOR, hidden
+	G_TYPE_STRING   // COL_REMINDER_SHOWN, hidden
     );
 
     /*
@@ -2063,6 +2286,18 @@ int main(int argc, char *argv[]) {
     g_timeout_add_seconds(
         3600,
         on_water_reminder_timeout,
+        window
+    );
+
+    /*
+     * Check upcoming task reminders every minute.
+     *
+     * If an unfinished task is within the next 10 minutes,
+     * the app will show a reminder dialog.
+     */
+    g_timeout_add_seconds(
+        60,
+        on_event_reminder_timeout,
         window
     );
 
