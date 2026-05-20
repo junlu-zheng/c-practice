@@ -25,6 +25,7 @@
 #include <gtk/gtk.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define PLANS_FILE "plans.txt"
 #define DELETED_FILE "deleted_plans.txt"
@@ -437,6 +438,77 @@ static void set_entry_from_date(GtkWidget *entry, const GDate *date) {
     );
 
     gtk_entry_set_text(GTK_ENTRY(entry), buffer);
+}
+
+/*
+ * Show a diary reminder if the app is opened after 21:00.
+ *
+ * Behaviour:
+ * - If current local time is before 21:00, do nothing.
+ * - If current local time is after 21:00, show a dialog.
+ * - If the user clicks Yes, fill the input boxes with a diary task.
+ *
+ * We only fill the input boxes.
+ * We do not automatically add the task.
+ * This prevents duplicate diary tasks if the user opens the app many times.
+ */
+static void show_diary_prompt_if_needed(GtkWindow *parent) {
+    time_t now = time(NULL);
+    struct tm *local = localtime(&now);
+
+    if (local == NULL) {
+        return;
+    }
+
+    /*
+     * tm_hour uses 24-hour time.
+     * 21 means 21:00, or 9pm.
+     */
+    if (local->tm_hour < 21) {
+        return;
+    }
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_MODAL,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_YES_NO,
+        "It is after 21:00. Do you want to write today's diary?"
+    );
+
+    gtk_window_set_title(GTK_WINDOW(dialog), "Diary Reminder");
+
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (response == GTK_RESPONSE_YES) {
+        char date_text[11];
+
+        /*
+         * tm_year counts years since 1900.
+         * tm_mon counts months from 0 to 11.
+         */
+        snprintf(
+            date_text,
+            sizeof(date_text),
+            "%04d-%02d-%02d",
+            local->tm_year + 1900,
+            local->tm_mon + 1,
+            local->tm_mday
+        );
+
+        /*
+         * Fill the input boxes with a diary task.
+         * The user can still edit it before clicking Add Task.
+         */
+        gtk_entry_set_text(GTK_ENTRY(date_entry), date_text);
+        gtk_entry_set_text(GTK_ENTRY(time_entry), "21:00");
+        gtk_entry_set_text(GTK_ENTRY(category_entry), "Diary");
+        gtk_entry_set_text(GTK_ENTRY(title_entry), "Write diary");
+        gtk_entry_set_text(GTK_ENTRY(note_entry), "Write a short diary for today.");
+
+        set_status("Diary task prepared. Click Add Task to save it.");
+    }
 }
 
 /*
@@ -1936,6 +2008,13 @@ int main(int argc, char *argv[]) {
     load_tasks();
 
     gtk_widget_show_all(window);
+
+    /*
+     * After the window is shown, check whether we should remind the user
+     * to write a diary.
+     */
+    show_diary_prompt_if_needed(GTK_WINDOW(window));
+
     gtk_main();
 
     return 0;
