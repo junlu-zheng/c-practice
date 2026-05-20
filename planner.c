@@ -112,6 +112,15 @@ static GtkWidget *view_mode_combo;
 static GtkWidget *view_date_entry;
 
 /*
+ * Function declaration.
+ *
+ * move_view_date() uses refresh_view(),
+ * but refresh_view() is defined later in the file.
+ * In C, we need to declare it before it is used.
+ */
+static void refresh_view(void);
+
+/*
  * This stores the row currently being edited.
  *
  * Why use GtkTreeRowReference instead of GtkTreeIter?
@@ -408,6 +417,140 @@ static gboolean is_same_week(const char *task_date_text, const char *view_date_t
         g_date_compare(&task_date, &week_start) >= 0 &&
         g_date_compare(&task_date, &week_end) <= 0
     );
+}
+
+/*
+ * Write a GDate back into a GtkEntry in YYYY-MM-DD format.
+ *
+ * Example:
+ * GDate representing 21 May 2026
+ * becomes:
+ * 2026-05-21
+ */
+static void set_entry_from_date(GtkWidget *entry, const GDate *date) {
+    char buffer[11];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%04d-%02d-%02d",
+        g_date_get_year(date),
+        g_date_get_month(date),
+        g_date_get_day(date)
+    );
+
+    gtk_entry_set_text(GTK_ENTRY(entry), buffer);
+}
+
+/*
+ * Move the current view date forward or backward.
+ *
+ * direction = -1 means Previous
+ * direction =  1 means Next
+ *
+ * The movement depends on the current view mode:
+ * - Day view:   move by 1 day
+ * - Week view:  move by 7 days
+ * - Month view: move by 1 month
+ */
+static void move_view_date(int direction) {
+    if (view_mode_combo == NULL || view_date_entry == NULL) {
+        return;
+    }
+
+    int view_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(view_mode_combo));
+
+    /*
+     * All view does not use a date.
+     */
+    if (view_mode == 0) {
+        set_status("Previous / Next only works in Day, Week, or Month view.");
+        return;
+    }
+
+    /*
+     * Format the view date first.
+     * This allows the user to type 20260521 before clicking Next.
+     */
+    format_date_entry(view_date_entry);
+
+    const char *view_date_text = gtk_entry_get_text(GTK_ENTRY(view_date_entry));
+
+    GDate date;
+    g_date_clear(&date, 1);
+
+    if (!parse_date_string(view_date_text, &date)) {
+        set_status("Please enter a valid view date first, for example 20260521.");
+        return;
+    }
+
+    if (view_mode == 1) {
+        /*
+         * Day view:
+         * move one day at a time.
+         */
+        if (direction > 0) {
+            g_date_add_days(&date, 1);
+        } else {
+            g_date_subtract_days(&date, 1);
+        }
+    } else if (view_mode == 2) {
+        /*
+         * Week view:
+         * move seven days at a time.
+         */
+        if (direction > 0) {
+            g_date_add_days(&date, 7);
+        } else {
+            g_date_subtract_days(&date, 7);
+        }
+    } else if (view_mode == 3) {
+        /*
+         * Month view:
+         * move one month at a time.
+         */
+        if (direction > 0) {
+            g_date_add_months(&date, 1);
+        } else {
+            g_date_subtract_months(&date, 1);
+        }
+    }
+
+    /*
+     * Put the new date back into the View date box.
+     */
+    set_entry_from_date(view_date_entry, &date);
+
+    /*
+     * Re-apply the filter so the table updates immediately.
+     */
+    refresh_view();
+
+    if (direction > 0) {
+        set_status("Moved to next period.");
+    } else {
+        set_status("Moved to previous period.");
+    }
+}
+
+/*
+ * This function runs when the user clicks Previous.
+ */
+static void on_previous_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    move_view_date(-1);
+}
+
+/*
+ * This function runs when the user clicks Next.
+ */
+static void on_next_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    move_view_date(1);
 }
 
 /*
@@ -1551,15 +1694,21 @@ int main(int argc, char *argv[]) {
     gtk_entry_set_placeholder_text(GTK_ENTRY(view_date_entry), "Type 20260521");
 
     GtkWidget *apply_view_button = gtk_button_new_with_label("Apply View");
+    GtkWidget *previous_button = gtk_button_new_with_label("Previous");
+    GtkWidget *next_button = gtk_button_new_with_label("Next");
 
     gtk_box_pack_start(GTK_BOX(view_box), view_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(view_box), view_mode_combo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(view_box), view_date_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(view_box), view_date_entry, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(view_box), apply_view_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(view_box), previous_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(view_box), next_button, FALSE, FALSE, 0);
 
     g_signal_connect(view_mode_combo, "changed", G_CALLBACK(on_view_changed), NULL);
     g_signal_connect(apply_view_button, "clicked", G_CALLBACK(on_view_changed), NULL);
+    g_signal_connect(previous_button, "clicked", G_CALLBACK(on_previous_clicked), NULL);
+    g_signal_connect(next_button, "clicked", G_CALLBACK(on_next_clicked), NULL);
     g_signal_connect(view_date_entry, "focus-out-event", G_CALLBACK(on_date_focus_out), NULL);
 
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
