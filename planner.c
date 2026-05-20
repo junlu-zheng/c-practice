@@ -512,6 +512,42 @@ static void show_diary_prompt_if_needed(GtkWindow *parent) {
 }
 
 /*
+ * This function runs every hour while the app is open.
+ *
+ * GTK timers need a callback function with this form:
+ *
+ * static gboolean function_name(gpointer data)
+ *
+ * The return value controls whether the timer repeats:
+ * - TRUE  means run again later
+ * - FALSE means stop the timer
+ */
+static gboolean on_water_reminder_timeout(gpointer data) {
+    GtkWindow *parent = GTK_WINDOW(data);
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        parent,
+        GTK_DIALOG_MODAL,
+        GTK_MESSAGE_INFO,
+        GTK_BUTTONS_OK,
+        "Time to drink some water."
+    );
+
+    gtk_window_set_title(GTK_WINDOW(dialog), "Water Reminder");
+
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    set_status("Water reminder shown.");
+
+    /*
+     * Return TRUE so GTK will call this function again
+     * after the same time interval.
+     */
+    return TRUE;
+}
+
+/*
  * Move the current view date forward or backward.
  *
  * direction = -1 means Previous
@@ -2014,6 +2050,21 @@ int main(int argc, char *argv[]) {
      * to write a diary.
      */
     show_diary_prompt_if_needed(GTK_WINDOW(window));
+
+    /*
+     * Start a repeating water reminder.
+     *
+     * g_timeout_add_seconds(3600, ...)
+     * means:
+     * call on_water_reminder_timeout() every 3600 seconds.
+     *
+     * 3600 seconds = 1 hour.
+     */
+    g_timeout_add_seconds(
+        3600,
+        on_water_reminder_timeout,
+        window
+    );
 
     gtk_main();
 
