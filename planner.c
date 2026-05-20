@@ -30,34 +30,31 @@
 #define DELETED_FILE "deleted_plans.txt"
 
 /*
- * The task table has visible columns and one hidden column.
+ * The task table has visible columns and hidden helper columns.
  *
  * Visible columns:
  * - Date
+ * - Weekday
  * - Time
  * - Category
  * - Title
  * - Note
  * - Done
  *
- * Hidden column:
+ * Hidden columns:
  * - Sort key
- *
- * The sort key combines date and time, for example:
- * 2026-05-21 14:30
- *
- * Because our date format is YYYY-MM-DD
- * and our time format is HH:MM,
- * alphabetical sorting gives the same order as time sorting.
+ * - Text color
  */
 enum {
     COL_DATE,
+    COL_WEEKDAY,
     COL_TIME,
     COL_CATEGORY,
     COL_TITLE,
     COL_NOTE,
     COL_DONE,
     COL_SORT_KEY,   // Hidden column used only for sorting
+    COL_COLOR,      // Hidden column used only for text color
     N_COLS
 };
 
@@ -689,6 +686,93 @@ static gboolean on_time_focus_out(GtkWidget *widget, GdkEvent *event, gpointer d
 }
 
 /*
+ * Convert a date string in YYYY-MM-DD format into a weekday name.
+ *
+ * Example:
+ * 2026-05-21 -> Thursday
+ *
+ * If the date is invalid, return an empty string.
+ *
+ * We return constant strings such as "Monday".
+ * Therefore, the caller does not need to free the result.
+ */
+static const char *get_weekday_name(const char *date_text) {
+    if (date_text == NULL || strlen(date_text) != 10) {
+        return "";
+    }
+
+    int year;
+    int month;
+    int day;
+
+    if (sscanf(date_text, "%d-%d-%d", &year, &month, &day) != 3) {
+        return "";
+    }
+
+    if (!g_date_valid_dmy(day, month, year)) {
+        return "";
+    }
+
+    GDate date;
+    g_date_clear(&date, 1);
+    g_date_set_dmy(&date, day, month, year);
+
+    GDateWeekday weekday = g_date_get_weekday(&date);
+
+    switch (weekday) {
+        case G_DATE_MONDAY:
+            return "Monday";
+        case G_DATE_TUESDAY:
+            return "Tuesday";
+        case G_DATE_WEDNESDAY:
+            return "Wednesday";
+        case G_DATE_THURSDAY:
+            return "Thursday";
+        case G_DATE_FRIDAY:
+            return "Friday";
+        case G_DATE_SATURDAY:
+            return "Saturday";
+        case G_DATE_SUNDAY:
+            return "Sunday";
+        default:
+            return "";
+    }
+}
+
+/*
+ * Decide the text color of a task based on its category.
+ *
+ * Current rule:
+ * - Important / Urgent / Deadline tasks are shown in orange.
+ * - Other tasks use the default text color.
+ *
+ * The return value is a constant string.
+ * The caller does not need to free it.
+ */
+static const char *get_task_color(const char *category) {
+    if (category == NULL) {
+        return "black";
+    }
+
+    /*
+     * g_ascii_strcasecmp() compares strings without caring about case.
+     *
+     * Example:
+     * "important", "Important", and "IMPORTANT"
+     * are treated as the same word.
+     */
+    if (
+        g_ascii_strcasecmp(category, "Important") == 0 ||
+        g_ascii_strcasecmp(category, "Urgent") == 0 ||
+        g_ascii_strcasecmp(category, "Deadline") == 0
+    ) {
+        return "orange";
+    }
+
+    return "black";
+}
+
+/*
  * Clean text before saving it into plans.txt.
  *
  * Our file format uses | to separate fields:
@@ -754,6 +838,18 @@ static void append_task(
      * on the same date.
      */
     char *sort_key = g_strdup_printf("%s %s", date, time);
+    /*
+     * Calculate weekday from the date.
+     * This is displayed in the table but not saved separately.
+     * When the app loads tasks from plans.txt, it calculates weekday again.
+     */
+    const char *weekday = get_weekday_name(date);
+
+    /*
+     * Decide the display color for this task.
+     * Important / Urgent / Deadline tasks will be orange.
+     */
+    const char *color = get_task_color(category);
 
     /*
      * Add a new empty row to the store.
@@ -774,12 +870,14 @@ static void append_task(
         store,
         &iter,
         COL_DATE, date,
+	COL_WEEKDAY, weekday,
         COL_TIME, time,
         COL_CATEGORY, category,
         COL_TITLE, title,
         COL_NOTE, note,
         COL_DONE, done ? "Yes" : "No",
 	COL_SORT_KEY, sort_key,
+	COL_COLOR, color,
         -1
     );
 
@@ -1368,16 +1466,26 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
 	 * but the sorting order may still use the old value.
 	 */
 	char *sort_key = g_strdup_printf("%s %s", date, time);
+	/*
+         * Recalculate weekday after editing the date.
+         */
+        const char *weekday = get_weekday_name(date);
+	/*
+         * Recalculate color after editing the category.
+         */
+        const char *color = get_task_color(category);
 
 	gtk_list_store_set(
 	    GTK_LIST_STORE(model),
 	    &iter,
 	    COL_DATE, date,
+	    COL_WEEKDAY, weekday,
 	    COL_TIME, time,
 	    COL_CATEGORY, category,
 	    COL_TITLE, title,
 	    COL_NOTE, note,
 	    COL_SORT_KEY, sort_key,
+	    COL_COLOR, color,
 	    -1
 	);
 
@@ -1591,6 +1699,15 @@ static void on_window_destroy(GtkWidget *widget, gpointer data) {
     gtk_main_quit();
 }
 
+/*
+ * Add one visible text column to the task table.
+ *
+ * Besides the text itself, this function also connects
+ * the renderer's foreground color to COL_COLOR.
+ *
+ * This means every visible column in the same row
+ * can use the row's color.
+ */
 static void add_column(const char *title, int column_id) {
     GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
 
@@ -1599,6 +1716,8 @@ static void add_column(const char *title, int column_id) {
         renderer,
         "text",
         column_id,
+        "foreground",
+        COL_COLOR,
         NULL
     );
 
@@ -1733,18 +1852,20 @@ int main(int argc, char *argv[]) {
     /*
      * Create the data model for the task table.
      *
-     * There are 7 columns in the model:
-     * 6 visible columns and 1 hidden sort key column.
+     * There are 9 columns in the model:
+     * 7 visible columns and 2 hidden sort key column.
      */
     store = gtk_list_store_new(
         N_COLS,
         G_TYPE_STRING,  // COL_DATE
+	G_TYPE_STRING,  // COL_WEEKDAY
         G_TYPE_STRING,  // COL_TIME
         G_TYPE_STRING,  // COL_CATEGORY
         G_TYPE_STRING,  // COL_TITLE
         G_TYPE_STRING,  // COL_NOTE
         G_TYPE_STRING,  // COL_DONE
-        G_TYPE_STRING   // COL_SORT_KEY, hidden
+        G_TYPE_STRING,   // COL_SORT_KEY, hidden
+	G_TYPE_STRING   // COL_COLOR, hidden
     );
 
     /*
@@ -1769,6 +1890,7 @@ int main(int argc, char *argv[]) {
      */
     tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(filter_model));
     add_column("Date", COL_DATE);
+    add_column("Weekday", COL_WEEKDAY);
     add_column("Time", COL_TIME);
     add_column("Category", COL_CATEGORY);
     add_column("Title", COL_TITLE);
