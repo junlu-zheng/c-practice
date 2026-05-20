@@ -85,6 +85,33 @@ static GtkWidget *tree_view;       // Table-like view that displays all tasks
 static GtkListStore *store;
 
 /*
+ * filter_model sits between the real data store and the visible table.
+ *
+ * store:
+ * - contains all tasks
+ *
+ * filter_model:
+ * - decides which tasks should be visible in the current view
+ *
+ * tree_view:
+ * - displays only the tasks allowed by filter_model
+ */
+static GtkTreeModelFilter *filter_model;
+
+/*
+ * View controls.
+ *
+ * view_mode_combo lets the user choose:
+ * - All
+ * - Day
+ * - Month
+ *
+ * view_date_entry stores the date used for filtering.
+ */
+static GtkWidget *view_mode_combo;
+static GtkWidget *view_date_entry;
+
+/*
  * This stores the row currently being edited.
  *
  * Why use GtkTreeRowReference instead of GtkTreeIter?
@@ -284,6 +311,222 @@ static gboolean format_time_entry(GtkWidget *entry) {
     }
 
     return TRUE;
+}
+
+/*
+ * Convert a date string in YYYY-MM-DD format into a GDate.
+ *
+ * Example:
+ * input:  "2026-05-21"
+ * output: a valid GDate object representing 21 May 2026
+ *
+ * We return TRUE if the date is valid.
+ * We return FALSE if the date is missing or invalid.
+ */
+static gboolean parse_date_string(const char *date_text, GDate *date) {
+    if (date_text == NULL || strlen(date_text) != 10) {
+        return FALSE;
+    }
+
+    int year;
+    int month;
+    int day;
+
+    /*
+     * Read numbers from YYYY-MM-DD.
+     */
+    if (sscanf(date_text, "%d-%d-%d", &year, &month, &day) != 3) {
+        return FALSE;
+    }
+
+    /*
+     * Check whether the date is logically valid.
+     * For example:
+     * 2026-02-30 is not valid.
+     */
+    if (!g_date_valid_dmy(day, month, year)) {
+        return FALSE;
+    }
+
+    g_date_set_dmy(date, day, month, year);
+    return TRUE;
+}
+
+/*
+ * Check whether task_date is in the same Monday-to-Sunday week
+ * as view_date.
+ *
+ * Example:
+ * view_date = 2026-05-21
+ * That week is 2026-05-18 to 2026-05-24.
+ *
+ * Any task date inside that range should be visible.
+ */
+static gboolean is_same_week(const char *task_date_text, const char *view_date_text) {
+    GDate task_date;
+    GDate week_start;
+    GDate week_end;
+
+    g_date_clear(&task_date, 1);
+    g_date_clear(&week_start, 1);
+    g_date_clear(&week_end, 1);
+
+    if (!parse_date_string(task_date_text, &task_date)) {
+        return FALSE;
+    }
+
+    if (!parse_date_string(view_date_text, &week_start)) {
+        return FALSE;
+    }
+
+    /*
+     * GDateWeekday uses:
+     * Monday = 1
+     * Tuesday = 2
+     * ...
+     * Sunday = 7
+     *
+     * To get Monday of the current week,
+     * subtract weekday - 1 days.
+     */
+    GDateWeekday weekday = g_date_get_weekday(&week_start);
+    g_date_subtract_days(&week_start, weekday - 1);
+
+    /*
+     * Week end is Sunday.
+     */
+    week_end = week_start;
+    g_date_add_days(&week_end, 6);
+
+    /*
+     * g_date_compare(a, b):
+     * < 0 means a is before b
+     * = 0 means same date
+     * > 0 means a is after b
+     */
+    return (
+        g_date_compare(&task_date, &week_start) >= 0 &&
+        g_date_compare(&task_date, &week_end) <= 0
+    );
+}
+
+/*
+ * Decide whether a task should be visible in the current view.
+ *
+ * This function is used by GtkTreeModelFilter.
+ *
+ * It checks:
+ * 1. Which view mode the user selected.
+ * 2. The task's date.
+ * 3. The date entered in the view date box.
+ *
+ * View modes:
+ * 0 = All
+ * 1 = Day
+ * 2 = Week
+ * 3 = Month
+ */
+static gboolean task_visible_func(GtkTreeModel *model, GtkTreeIter *iter, gpointer data) {
+    (void)data;
+
+    /*
+     * If the view controls are not ready yet,
+     * show everything by default.
+     */
+    if (view_mode_combo == NULL || view_date_entry == NULL) {
+        return TRUE;
+    }
+
+    int view_mode = gtk_combo_box_get_active(GTK_COMBO_BOX(view_mode_combo));
+
+    /*
+     * All view:
+     * show every task.
+     */
+    if (view_mode == 0) {
+        return TRUE;
+    }
+
+    const char *view_date = gtk_entry_get_text(GTK_ENTRY(view_date_entry));
+
+    /*
+     * If the user chooses Day or Month view but has not entered
+     * a complete date yet, show nothing.
+     */
+    if (strlen(view_date) != 10) {
+        return FALSE;
+    }
+
+    char *task_date = NULL;
+
+    /*
+     * Read the Date column from the current task row.
+     */
+    gtk_tree_model_get(
+        model,
+        iter,
+        COL_DATE, &task_date,
+        -1
+    );
+
+    if (task_date == NULL) {
+        return FALSE;
+    }
+
+    gboolean visible = FALSE;
+    
+    if (view_mode == 1) {
+        /*
+         * Day view:
+         * the whole date must match.
+         */
+        visible = strcmp(task_date, view_date) == 0;
+    } else if (view_mode == 2) {
+        /*
+         * Week view:
+         * show tasks in the same Monday-to-Sunday week
+         * as the view date.
+         */
+        visible = is_same_week(task_date, view_date);
+    } else if (view_mode == 3) {
+        /*
+         * Month view:
+         * only compare YYYY-MM.
+         */
+        visible = strncmp(task_date, view_date, 7) == 0;
+    }
+ 
+    g_free(task_date);
+    return visible;
+}
+
+/*
+ * Re-apply the current view filter.
+ *
+ * We call this when:
+ * - the user changes View mode
+ * - the user changes View date
+ * - the user clicks Apply View
+ */
+static void refresh_view(void) {
+    if (view_date_entry != NULL) {
+        format_date_entry(view_date_entry);
+    }
+
+    if (filter_model != NULL) {
+        gtk_tree_model_filter_refilter(filter_model);
+    }
+}
+
+/*
+ * This function runs when the user changes the view controls.
+ */
+static void on_view_changed(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    (void)data;
+
+    refresh_view();
+    set_status("View updated.");
 }
 
 /*
@@ -696,6 +939,36 @@ static void load_tasks(void) {
 }
 
 /*
+ * Get the selected row from the visible table
+ * and convert it back to the real row in the store.
+ *
+ * Why do we need this?
+ *
+ * After adding Day / Month views, the tree_view no longer displays
+ * the store directly. It displays filter_model.
+ *
+ * So when the user selects a visible row, that row belongs to filter_model.
+ * But editing, deleting and saving must happen in the real store.
+ */
+static gboolean get_selected_store_iter(GtkTreeIter *store_iter) {
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+    GtkTreeModel *selected_model;
+    GtkTreeIter filter_iter;
+
+    if (!gtk_tree_selection_get_selected(selection, &selected_model, &filter_iter)) {
+        return FALSE;
+    }
+
+    gtk_tree_model_filter_convert_iter_to_child_iter(
+        filter_model,
+        store_iter,
+        &filter_iter
+    );
+
+    return TRUE;
+}
+
+/*
  * This function runs when the user clicks the "Add Task" button.
  *
  * Steps:
@@ -783,20 +1056,12 @@ static void on_toggle_done_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
 
-    /*
-     * Get the currently selected row from the task table.
-     */
-    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
-    GtkTreeModel *model;
+    GtkTreeModel *model = GTK_TREE_MODEL(store);
     GtkTreeIter iter;
 
-    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+    if (get_selected_store_iter(&iter)) {
         char *done_text = NULL;
 
-        /*
-         * Read the current Done value from the selected row.
-         * It should be either "Yes" or "No".
-         */
         gtk_tree_model_get(
             model,
             &iter,
@@ -804,30 +1069,17 @@ static void on_toggle_done_clicked(GtkWidget *widget, gpointer data) {
             -1
         );
 
-        /*
-         * Toggle the value.
-         *
-         * If it is currently "Yes", change it to "No".
-         * Otherwise, change it to "Yes".
-         */
         if (done_text != NULL && strcmp(done_text, "Yes") == 0) {
-            gtk_list_store_set(GTK_LIST_STORE(model), &iter, COL_DONE, "No", -1);
+            gtk_list_store_set(store, &iter, COL_DONE, "No", -1);
             set_status("Task marked as unfinished.");
         } else {
-            gtk_list_store_set(GTK_LIST_STORE(model), &iter, COL_DONE, "Yes", -1);
+            gtk_list_store_set(store, &iter, COL_DONE, "Yes", -1);
             set_status("Task marked as done.");
         }
 
-        /*
-         * done_text was allocated by gtk_tree_model_get(),
-         * so we need to free it.
-         */
         g_free(done_text);
-
-        /*
-         * Save the new Done status immediately.
-         */
         save_tasks();
+        refresh_view();
     } else {
         set_status("Please select a task first.");
     }
@@ -842,24 +1094,21 @@ static void on_toggle_done_clicked(GtkWidget *widget, gpointer data) {
  * 3. Put those values back into the input boxes.
  * 4. Store a reference to this row, so that Update Task knows which row to modify.
  */
+
 static void on_edit_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
 
-    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
-    GtkTreeModel *model;
+    GtkTreeModel *model = GTK_TREE_MODEL(store);
     GtkTreeIter iter;
 
-    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+    if (get_selected_store_iter(&iter)) {
         char *date;
         char *time;
         char *category;
         char *title;
         char *note;
 
-        /*
-         * Read task information from the selected row.
-         */
         gtk_tree_model_get(
             model,
             &iter,
@@ -871,37 +1120,23 @@ static void on_edit_clicked(GtkWidget *widget, gpointer data) {
             -1
         );
 
-        /*
-         * Put the selected task back into the input boxes.
-         * Now the user can edit the text.
-         */
         gtk_entry_set_text(GTK_ENTRY(date_entry), date);
         gtk_entry_set_text(GTK_ENTRY(time_entry), time);
         gtk_entry_set_text(GTK_ENTRY(category_entry), category);
         gtk_entry_set_text(GTK_ENTRY(title_entry), title);
         gtk_entry_set_text(GTK_ENTRY(note_entry), note);
 
-        /*
-         * If we were already editing another row, free the old reference first.
-         */
         if (editing_row_ref != NULL) {
             gtk_tree_row_reference_free(editing_row_ref);
             editing_row_ref = NULL;
         }
 
-        /*
-         * Create a row reference for the selected task.
-         * This tells Update Task which row should be changed later.
-         */
         GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
         editing_row_ref = gtk_tree_row_reference_new(model, path);
         gtk_tree_path_free(path);
 
         set_status("Editing selected task. Modify the fields, then click Update Task.");
 
-        /*
-         * Free strings created by gtk_tree_model_get().
-         */
         g_free(date);
         g_free(time);
         g_free(category);
@@ -1006,6 +1241,7 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
         g_free(sort_key);
 
         save_tasks();
+	refresh_view();
         set_status("Task updated.");
 
         /*
@@ -1029,15 +1265,15 @@ static void on_update_clicked(GtkWidget *widget, gpointer data) {
  *
  * This gives the user a chance to restore it later.
  */
+
 static void on_delete_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
 
-    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
-    GtkTreeModel *model;
+    GtkTreeModel *model = GTK_TREE_MODEL(store);
     GtkTreeIter iter;
 
-    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+    if (get_selected_store_iter(&iter)) {
         char *date;
         char *time;
         char *category;
@@ -1045,10 +1281,6 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
         char *note;
         char *done_text;
 
-        /*
-         * Read the selected task before deleting it.
-         * We need this information so we can save it into deleted_plans.txt.
-         */
         gtk_tree_model_get(
             model,
             &iter,
@@ -1061,29 +1293,17 @@ static void on_delete_clicked(GtkWidget *widget, gpointer data) {
             -1
         );
 
-        /*
-         * Save the deleted task to the trash file first.
-         */
         save_deleted_task(date, time, category, title, note, done_text);
 
-        /*
-         * Now remove it from the visible task list.
-         */
-        gtk_list_store_remove(GTK_LIST_STORE(model), &iter);
+        gtk_list_store_remove(store, &iter);
 
-        /*
-         * If the user deletes a task while editing,
-         * cancel the current edit mode to avoid updating a deleted row.
-         */
         if (editing_row_ref != NULL) {
             gtk_tree_row_reference_free(editing_row_ref);
             editing_row_ref = NULL;
         }
 
-        /*
-         * Save the current active task list after deletion.
-         */
         save_tasks();
+        refresh_view();
 
         set_status("Task moved to trash. You can restore it with Restore Last Deleted.");
 
@@ -1305,6 +1525,43 @@ int main(int argc, char *argv[]) {
     gtk_grid_attach(GTK_GRID(grid), note_label, 0, 3, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), note_entry, 1, 3, 3, 1);
 
+    /*
+     * View control area.
+     *
+     * This lets the user choose whether to see:
+     * - all tasks
+     * - tasks for one day
+     * - tasks for one month
+     */
+    GtkWidget *view_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(main_box), view_box, FALSE, FALSE, 0);
+
+    GtkWidget *view_label = gtk_label_new("View:");
+    view_mode_combo = gtk_combo_box_text_new();
+
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(view_mode_combo), "All");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(view_mode_combo), "Day");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(view_mode_combo), "Week");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(view_mode_combo), "Month");
+
+    gtk_combo_box_set_active(GTK_COMBO_BOX(view_mode_combo), 0);
+
+    GtkWidget *view_date_label = gtk_label_new("View date:");
+    view_date_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(view_date_entry), "Type 20260521");
+
+    GtkWidget *apply_view_button = gtk_button_new_with_label("Apply View");
+
+    gtk_box_pack_start(GTK_BOX(view_box), view_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(view_box), view_mode_combo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(view_box), view_date_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(view_box), view_date_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(view_box), apply_view_button, FALSE, FALSE, 0);
+
+    g_signal_connect(view_mode_combo, "changed", G_CALLBACK(on_view_changed), NULL);
+    g_signal_connect(apply_view_button, "clicked", G_CALLBACK(on_view_changed), NULL);
+    g_signal_connect(view_date_entry, "focus-out-event", G_CALLBACK(on_date_focus_out), NULL);
+
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(main_box), button_box, FALSE, FALSE, 0);
 
@@ -1341,7 +1598,27 @@ int main(int argc, char *argv[]) {
         G_TYPE_STRING   // COL_SORT_KEY, hidden
     );
 
-    tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    /*
+     * Create a filter model on top of the real store.
+     *
+     * The store keeps all tasks.
+     * The filter_model decides which tasks are visible.
+     */
+    filter_model = GTK_TREE_MODEL_FILTER(
+        gtk_tree_model_filter_new(GTK_TREE_MODEL(store), NULL)
+    );
+
+    gtk_tree_model_filter_set_visible_func(
+        filter_model,
+        task_visible_func,
+        NULL,
+        NULL
+    );
+
+    /*
+     * The tree view displays the filter model, not the store directly.
+     */
+    tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(filter_model));
     add_column("Date", COL_DATE);
     add_column("Time", COL_TIME);
     add_column("Category", COL_CATEGORY);
